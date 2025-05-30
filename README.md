@@ -1,6 +1,6 @@
 ![ChEMBL MCP Server Logo](chembl-mcp-server-logo.png)
 
-# ChEMBL MCP Server
+# **Unofficial** ChEMBL MCP Server
 
 A comprehensive Model Context Protocol (MCP) server providing advanced access to the ChEMBL chemical database. This server offers 22 specialized tools enabling AI assistants and MCP clients to perform sophisticated drug discovery research, chemical informatics analysis, and bioactivity investigations directly through ChEMBL's REST API.
 
