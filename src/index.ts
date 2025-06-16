@@ -175,6 +175,18 @@ const isValidBatchArgs = (
   );
 };
 
+const isValidInchiSearchArgs = (
+  args: any
+): args is { inchi: string; limit?: number } => {
+  return (
+    typeof args === 'object' &&
+    args !== null &&
+    typeof args.inchi === 'string' &&
+    args.inchi.length > 0 &&
+    (args.limit === undefined || (typeof args.limit === 'number' && args.limit > 0 && args.limit <= 1000))
+  );
+};
+
 class ChEMBLServer {
   private server: Server;
   private apiClient: AxiosInstance;
@@ -877,7 +889,28 @@ class ChEMBLServer {
 
   // Simplified placeholder implementations for the remaining tools
   private async handleSearchByInchi(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'InChI search not yet implemented', args }, null, 2) }] };
+    if (!isValidInchiSearchArgs(args)) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments for InChI search.');
+    }
+
+    const params: any = {
+        limit: args.limit || 25,
+    };
+
+    if (args.inchi.startsWith('InChI=')) {
+        params['molecule_structures__standard_inchi'] = args.inchi;
+    } else {
+        params['molecule_structures__standard_inchi_key'] = args.inchi;
+    }
+
+    try {
+      const response = await this.apiClient.get('/molecule.json', { params });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(response.data, null, 2) }],
+      };
+    } catch (error: any) {
+      throw new McpError(ErrorCode.InternalError, `ChEMBL API error: ${error.message}`);
+    }
   }
 
   private async handleGetCompoundStructure(args: any) {
@@ -907,7 +940,34 @@ class ChEMBLServer {
   }
 
   private async handleSearchSimilarCompounds(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Similarity search not yet implemented', args }, null, 2) }] };
+    if (!isValidSimilaritySearchArgs(args)) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid similarity search arguments');
+    }
+
+    const similarity = Math.round((args.similarity || 0.7) * 100);
+    const smiles = encodeURIComponent(args.smiles);
+
+    try {
+      const response = await this.apiClient.get(`/similarity/${smiles}/${similarity}.json`, {
+        params: {
+          limit: args.limit || 25,
+        },
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(response.data, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to search similar compounds: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   private async handleSearchTargets(args: any) {
@@ -936,7 +996,36 @@ class ChEMBLServer {
 
   // Placeholder implementations for remaining tools
   private async handleGetTargetCompounds(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Target compounds search not yet implemented', args }, null, 2) }] };
+    if (!args || typeof args.target_chembl_id !== 'string') {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: target_chembl_id is required');
+    }
+
+    try {
+      const params: any = {
+        target_chembl_id: args.target_chembl_id,
+        limit: args.limit || 25,
+      };
+
+      if (args.activity_type) {
+        params.standard_type = args.activity_type;
+      }
+
+      const response = await this.apiClient.get('/activity.json', { params });
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(response.data, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to get target compounds: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   private async handleSearchByUniprot(args: any) {
@@ -976,35 +1065,300 @@ class ChEMBLServer {
 
   // Remaining placeholder implementations
   private async handleSearchByActivityType(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Activity type search not yet implemented', args }, null, 2) }] };
+    if (!args || typeof args.activity_type !== 'string') {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: activity_type is required');
+    }
+
+    try {
+      const params: any = {
+        standard_type: args.activity_type,
+        limit: Math.min(args.limit || 10, 20), // Limit to max 20 results
+      };
+
+      if (args.min_value !== undefined) {
+        params.standard_value__gte = args.min_value;
+      }
+      if (args.max_value !== undefined) {
+        params.standard_value__lte = args.max_value;
+      }
+      if (args.units) {
+        params.standard_units = args.units;
+      }
+
+      const response = await this.apiClient.get('/activity.json', { params });
+      
+      // Extract and clean essential data only
+      const activities = response.data.activities || [];
+      const cleanedActivities = activities.slice(0, 10).map((activity: any) => ({
+        activity_id: activity.activity_id,
+        molecule_chembl_id: activity.molecule_chembl_id,
+        target_chembl_id: activity.target_chembl_id,
+        assay_chembl_id: activity.assay_chembl_id,
+        standard_type: activity.standard_type,
+        standard_value: activity.standard_value,
+        standard_units: activity.standard_units,
+        pchembl_value: activity.pchembl_value,
+        assay_description: activity.assay_description?.substring(0, 200) || '', // Truncate long descriptions
+        document_journal: activity.document_journal,
+        document_year: activity.document_year,
+      }));
+
+      const summary = {
+        total_count: response.data.page_meta?.total_count || activities.length,
+        returned_count: cleanedActivities.length,
+        activity_type: args.activity_type,
+        activities: cleanedActivities,
+      };
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(summary, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to search by activity type: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   private async handleGetDoseResponse(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Dose response not yet implemented', args }, null, 2) }] };
+    if (!args || typeof args.molecule_chembl_id !== 'string') {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: molecule_chembl_id is required');
+    }
+
+    try {
+      const params: any = {
+        molecule_chembl_id: args.molecule_chembl_id,
+        limit: args.limit || 25,
+      };
+
+      if (args.target_chembl_id) {
+        params.target_chembl_id = args.target_chembl_id;
+      }
+
+      // Focus on dose-response related activity types
+      params.standard_type__in = 'IC50,EC50,Ki,Kd,GI50,LC50,LD50';
+
+      const response = await this.apiClient.get('/activity.json', { params });
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(response.data, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to get dose response data: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   private async handleCompareActivities(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Activity comparison not yet implemented', args }, null, 2) }] };
+    if (!args || !Array.isArray(args.molecule_chembl_ids) || args.molecule_chembl_ids.length < 2) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: molecule_chembl_ids array with at least 2 compounds is required');
+    }
+
+    try {
+      const results = [];
+      
+      for (const chemblId of args.molecule_chembl_ids.slice(0, 5)) { // Limit to 5 compounds
+        const params: any = {
+          molecule_chembl_id: chemblId,
+          limit: 10, // Reduced limit per compound
+        };
+
+        if (args.target_chembl_id) {
+          params.target_chembl_id = args.target_chembl_id;
+        }
+        if (args.activity_type) {
+          params.standard_type = args.activity_type;
+        }
+
+        try {
+          const response = await this.apiClient.get('/activity.json', { params });
+          const activities = response.data.activities || [];
+          
+          // Extract only essential activity data
+          const cleanedActivities = activities.slice(0, 5).map((activity: any) => ({
+            activity_id: activity.activity_id,
+            target_chembl_id: activity.target_chembl_id,
+            assay_chembl_id: activity.assay_chembl_id,
+            standard_type: activity.standard_type,
+            standard_value: activity.standard_value,
+            standard_units: activity.standard_units,
+            pchembl_value: activity.pchembl_value,
+            assay_description: activity.assay_description?.substring(0, 100) || '',
+          }));
+
+          results.push({
+            molecule_chembl_id: chemblId,
+            activity_count: activities.length,
+            top_activities: cleanedActivities,
+            success: true
+          });
+        } catch (error) {
+          results.push({
+            molecule_chembl_id: chemblId,
+            error: error instanceof Error ? error.message : 'Unknown error',
+            success: false
+          });
+        }
+      }
+
+      const summary = {
+        comparison_type: args.activity_type || 'all_activities',
+        target_filter: args.target_chembl_id || 'all_targets',
+        compounds_compared: results.length,
+        comparison_results: results,
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(summary, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to compare activities: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   private async handleSearchDrugs(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Drug search not yet implemented', args }, null, 2) }] };
+    if (!isValidCompoundSearchArgs(args)) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments for drug search.');
+    }
+    try {
+      const response = await this.apiClient.get('/drug.json', {
+        params: {
+          pref_name__icontains: args.query,
+          limit: args.limit || 10,
+          offset: args.offset || 0,
+        },
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(response.data, null, 2) }],
+      };
+    } catch (error: any) {
+      throw new McpError(ErrorCode.InternalError, `ChEMBL API error: ${error.message}`);
+    }
   }
 
   private async handleGetDrugInfo(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Drug info not yet implemented', args }, null, 2) }] };
+    if (!isValidChemblIdArgs(args)) {
+        throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments for getting drug info.');
+    }
+    return this.handleGetCompoundInfo(args);
   }
 
   private async handleSearchDrugIndications(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Drug indications not yet implemented', args }, null, 2) }] };
+    if (typeof args.indication !== 'string' || args.indication.length === 0) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments for drug indication search.');
+    }
+    try {
+      const response = await this.apiClient.get('/drug_indication.json', {
+        params: {
+          efo_term__icontains: args.indication,
+          limit: args.limit || 10,
+          offset: args.offset || 0,
+        },
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(response.data, null, 2) }],
+      };
+    } catch (error: any) {
+      throw new McpError(ErrorCode.InternalError, `ChEMBL API error: ${error.message}`);
+    }
   }
 
   private async handleGetMechanismOfAction(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Mechanism of action not yet implemented', args }, null, 2) }] };
+    if (!args || typeof args.chembl_id !== 'string') {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: chembl_id is required');
+    }
+
+    try {
+      const response = await this.apiClient.get('/mechanism.json', {
+        params: {
+          molecule_chembl_id: args.chembl_id,
+          limit: 25,
+        },
+      });
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(response.data, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to get mechanism of action: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   private async handleAnalyzeAdmetProperties(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'ADMET analysis not yet implemented', args }, null, 2) }] };
+    if (!args || typeof args.chembl_id !== 'string') {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: chembl_id is required');
+    }
+
+    try {
+      const response = await this.apiClient.get(`/molecule/${args.chembl_id}.json`);
+      const compound = response.data;
+
+      // Extract ADMET-relevant properties
+      const admetAnalysis = {
+        chembl_id: compound.molecule_chembl_id,
+        pref_name: compound.pref_name,
+        molecular_properties: compound.molecule_properties,
+        admet_assessment: {
+          absorption: {
+            molecular_weight: compound.molecule_properties?.molecular_weight,
+            lipophilicity_alogp: compound.molecule_properties?.alogp,
+            polar_surface_area: compound.molecule_properties?.psa,
+            hbd_count: compound.molecule_properties?.hbd,
+            hba_count: compound.molecule_properties?.hba,
+            rotatable_bonds: compound.molecule_properties?.rtb,
+          },
+          drug_likeness: {
+            lipinski_violations: compound.molecule_properties?.num_ro5_violations,
+            ro3_pass: compound.molecule_properties?.ro3_pass,
+          },
+          structural_alerts: compound.compound_structural_alerts || [],
+        },
+        atc_classifications: compound.atc_classifications || [],
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(admetAnalysis, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to analyze ADMET properties: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   private async handleCalculateDescriptors(args: any) {
@@ -1016,7 +1370,98 @@ class ChEMBLServer {
   }
 
   private async handleAssessDrugLikeness(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Drug-likeness assessment not yet implemented', args }, null, 2) }] };
+    if (!args || (typeof args.chembl_id !== 'string' && typeof args.smiles !== 'string')) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: chembl_id or smiles is required');
+    }
+
+    try {
+      let compound;
+      
+      if (args.chembl_id) {
+        const response = await this.apiClient.get(`/molecule/${args.chembl_id}.json`);
+        compound = response.data;
+      } else {
+        // For SMILES input, search for the compound first
+        const searchResponse = await this.apiClient.get('/molecule.json', {
+          params: {
+            molecule_structures__canonical_smiles: args.smiles,
+            limit: 1,
+          },
+        });
+        
+        if (searchResponse.data.molecules && searchResponse.data.molecules.length > 0) {
+          compound = searchResponse.data.molecules[0];
+        } else {
+          throw new Error('Compound not found for the provided SMILES');
+        }
+      }
+
+      const props = compound.molecule_properties || {};
+      
+      // Lipinski Rule of Five assessment
+      const lipinski = {
+        molecular_weight: props.molecular_weight,
+        mw_pass: props.molecular_weight <= 500,
+        logp: props.alogp,
+        logp_pass: props.alogp <= 5,
+        hbd: props.hbd,
+        hbd_pass: props.hbd <= 5,
+        hba: props.hba,
+        hba_pass: props.hba <= 10,
+        violations: props.num_ro5_violations || 0,
+        overall_pass: (props.num_ro5_violations || 0) <= 1,
+      };
+
+      // Additional drug-likeness metrics
+      const drugLikenessAssessment = {
+        chembl_id: compound.molecule_chembl_id,
+        pref_name: compound.pref_name,
+        smiles: compound.molecule_structures?.canonical_smiles,
+        lipinski_rule_of_five: lipinski,
+        additional_metrics: {
+          polar_surface_area: props.psa,
+          psa_pass: props.psa <= 140,
+          rotatable_bonds: props.rtb,
+          rtb_pass: props.rtb <= 10,
+          ro3_pass: props.ro3_pass,
+          heavy_atoms: props.heavy_atoms,
+          aromatic_rings: props.aromatic_rings,
+        },
+        overall_drug_likeness: {
+          lipinski_compliant: lipinski.overall_pass,
+          lead_like: props.ro3_pass === 'Y',
+          oral_bioavailability_score: this.calculateOralBioavailabilityScore(props),
+        },
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(drugLikenessAssessment, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to assess drug-likeness: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  private calculateOralBioavailabilityScore(props: any): string {
+    let score = 0;
+    if (props.molecular_weight && props.molecular_weight <= 500) score++;
+    if (props.alogp && props.alogp <= 5) score++;
+    if (props.hbd && props.hbd <= 5) score++;
+    if (props.hba && props.hba <= 10) score++;
+    if (props.psa && props.psa <= 140) score++;
+    if (props.rtb && props.rtb <= 10) score++;
+    
+    if (score >= 5) return 'High';
+    if (score >= 3) return 'Medium';
+    return 'Low';
   }
 
   private async handleSubstructureSearch(args: any) {
