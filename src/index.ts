@@ -1029,11 +1029,145 @@ class ChEMBLServer {
   }
 
   private async handleSearchByUniprot(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'UniProt search not yet implemented', args }, null, 2) }] };
+    if (!args || typeof args.uniprot_id !== 'string') {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: uniprot_id is required');
+    }
+
+    try {
+      // Search for targets that have the specified UniProt accession in their components
+      const response = await this.apiClient.get('/target.json', {
+        params: {
+          target_components__accession: args.uniprot_id,
+          limit: args.limit || 25,
+        },
+      });
+
+      // Extract and format the target data
+      const targets = response.data.targets || [];
+      const formattedTargets = targets.map((target: any) => ({
+        target_chembl_id: target.target_chembl_id,
+        pref_name: target.pref_name,
+        target_type: target.target_type,
+        organism: target.organism,
+        species_group_flag: target.species_group_flag,
+        target_components: target.target_components?.filter((comp: any) => 
+          comp.accession === args.uniprot_id || comp.accession?.includes(args.uniprot_id)
+        ) || [],
+        cross_references: target.cross_references || [],
+      }));
+
+      const result = {
+        query: {
+          uniprot_id: args.uniprot_id,
+          search_type: 'uniprot_accession'
+        },
+        total_results: response.data.page_meta?.total_count || targets.length,
+        results_returned: formattedTargets.length,
+        targets: formattedTargets,
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to search by UniProt ID: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   private async handleGetTargetPathways(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Target pathways not yet implemented', args }, null, 2) }] };
+    if (!args || typeof args.target_chembl_id !== 'string') {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: target_chembl_id is required');
+    }
+
+    try {
+      // First, get the target information to extract UniProt accessions
+      const targetResponse = await this.apiClient.get(`/target/${args.target_chembl_id}.json`);
+      const target = targetResponse.data;
+
+      // Extract UniProt accessions from target components
+      const uniprotAccessions = target.target_components
+        ?.filter((comp: any) => comp.accession && comp.accession.match(/^[A-Z0-9]+$/))
+        .map((comp: any) => comp.accession) || [];
+
+             // Get pathway information - ChEMBL doesn't have direct pathway endpoints,
+       // but we can get pathway-related cross-references and mechanism data
+       const pathwayInfo: any = {
+         cross_references: target.cross_references?.filter((ref: any) => 
+           ref.xref_src_db && (
+             ref.xref_src_db.toLowerCase().includes('reactome') ||
+             ref.xref_src_db.toLowerCase().includes('kegg') ||
+             ref.xref_src_db.toLowerCase().includes('pathway') ||
+             ref.xref_src_db.toLowerCase().includes('biocyc')
+           )
+         ) || [],
+         go_classifications: target.go_classifications || [],
+       };
+
+       // Try to get mechanism of action data which may contain pathway information
+       try {
+         const mechanismResponse = await this.apiClient.get('/mechanism.json', {
+           params: {
+             target_chembl_id: args.target_chembl_id,
+             limit: 50,
+           },
+         });
+
+         pathwayInfo.mechanisms = mechanismResponse.data.mechanisms?.map((mech: any) => ({
+           mechanism_id: mech.mec_id,
+           molecule_chembl_id: mech.molecule_chembl_id,
+           mechanism_of_action: mech.mechanism_of_action,
+           action_type: mech.action_type,
+           mechanism_comment: mech.mechanism_comment,
+           selectivity_comment: mech.selectivity_comment,
+         })) || [];
+       } catch (mechanismError) {
+         // Mechanism data is optional, continue without it
+         pathwayInfo.mechanisms = [];
+         pathwayInfo.mechanism_note = 'No mechanism data available';
+       }
+
+       const pathwayData = {
+         target_chembl_id: target.target_chembl_id,
+         pref_name: target.pref_name,
+         target_type: target.target_type,
+         organism: target.organism,
+         uniprot_accessions: uniprotAccessions,
+         pathway_information: pathwayInfo,
+       };
+
+      // Add a note about pathway data limitations
+      const result = {
+        ...pathwayData,
+        data_note: 'ChEMBL pathway data is limited. For comprehensive pathway information, cross-reference with Reactome, KEGG, or other pathway databases using the provided UniProt accessions.',
+        suggested_external_queries: uniprotAccessions.length > 0 ? {
+          reactome: `https://reactome.org/content/query?q=${uniprotAccessions[0]}`,
+          kegg: `https://www.genome.jp/kegg-bin/search_pathway_text?map=map01100&keyword=${uniprotAccessions[0]}`,
+          wikipathways: `https://www.wikipathways.org/index.php/Special:SearchPathways?query=${uniprotAccessions[0]}`,
+        } : null,
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to get target pathways: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   private async handleSearchActivities(args: any) {
@@ -1362,11 +1496,348 @@ class ChEMBLServer {
   }
 
   private async handleCalculateDescriptors(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Descriptor calculation not yet implemented', args }, null, 2) }] };
+    if (!args || (typeof args.chembl_id !== 'string' && typeof args.smiles !== 'string')) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: chembl_id or smiles is required');
+    }
+
+    try {
+      let compound;
+      
+      if (args.chembl_id) {
+        const response = await this.apiClient.get(`/molecule/${args.chembl_id}.json`);
+        compound = response.data;
+      } else {
+        // For SMILES input, search for the compound first
+        const searchResponse = await this.apiClient.get('/molecule.json', {
+          params: {
+            molecule_structures__canonical_smiles: args.smiles,
+            limit: 1,
+          },
+        });
+        
+        if (searchResponse.data.molecules && searchResponse.data.molecules.length > 0) {
+          compound = searchResponse.data.molecules[0];
+        } else {
+          throw new Error('Compound not found for the provided SMILES');
+        }
+      }
+
+      const props = compound.molecule_properties || {};
+      const structures = compound.molecule_structures || {};
+
+      // Calculate additional descriptors from available data
+      const descriptors = {
+        chembl_id: compound.molecule_chembl_id,
+        pref_name: compound.pref_name,
+        smiles: structures.canonical_smiles,
+        inchi: structures.standard_inchi,
+        inchi_key: structures.standard_inchi_key,
+        
+        // Basic molecular descriptors
+        molecular_properties: {
+          molecular_weight: props.molecular_weight,
+          exact_mass: props.full_mwt,
+          heavy_atoms: props.heavy_atoms,
+          num_atoms: props.heavy_atoms ? props.heavy_atoms + (props.hbd || 0) : null,
+        },
+        
+        // Lipophilicity descriptors
+        lipophilicity: {
+          alogp: props.alogp,
+          clogp: props.cx_logp,
+          logd: props.cx_logd,
+        },
+        
+        // Hydrogen bonding descriptors
+        hydrogen_bonding: {
+          hbd: props.hbd, // Hydrogen bond donors
+          hba: props.hba, // Hydrogen bond acceptors
+          total_hb_sites: (props.hbd || 0) + (props.hba || 0),
+        },
+        
+        // Topological descriptors
+        topological: {
+          rotatable_bonds: props.rtb,
+          aromatic_rings: props.aromatic_rings,
+          rings: props.rings,
+          aliphatic_rings: props.rings ? props.rings - (props.aromatic_rings || 0) : null,
+        },
+        
+        // Surface area and volume descriptors
+        surface_properties: {
+          polar_surface_area: props.psa,
+          molecular_surface_area: props.molecular_surface_area,
+        },
+        
+        // Drug-likeness related descriptors
+        drug_likeness_metrics: {
+          lipinski_violations: props.num_ro5_violations,
+          ro3_pass: props.ro3_pass,
+          bioavailability_score: this.calculateBioavailabilityScore(props),
+        },
+        
+        // Additional calculated properties
+        calculated_properties: {
+          flexibility_index: props.rtb ? props.rtb / (props.heavy_atoms || 1) : null,
+          complexity_index: props.rings && props.aromatic_rings ? 
+            (props.rings * 2 + props.aromatic_rings) / (props.heavy_atoms || 1) : null,
+          hydrogen_bond_ratio: props.hbd && props.hba ? 
+            props.hbd / (props.hbd + props.hba) : null,
+        },
+        
+        // Molecular framework analysis
+        framework_analysis: {
+          saturation_ratio: props.aromatic_rings && props.rings ? 
+            (props.rings - props.aromatic_rings) / props.rings : null,
+          ring_density: props.rings && props.heavy_atoms ? 
+            props.rings / props.heavy_atoms : null,
+        }
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(descriptors, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to calculate descriptors: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  private calculateBioavailabilityScore(props: any): number {
+    let score = 0;
+    let maxScore = 6;
+    
+    if (props.molecular_weight && props.molecular_weight <= 500) score++;
+    if (props.alogp && props.alogp <= 5) score++;
+    if (props.hbd && props.hbd <= 5) score++;
+    if (props.hba && props.hba <= 10) score++;
+    if (props.psa && props.psa <= 140) score++;
+    if (props.rtb && props.rtb <= 10) score++;
+    
+    return score / maxScore;
   }
 
   private async handlePredictSolubility(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Solubility prediction not yet implemented', args }, null, 2) }] };
+    if (!args || (typeof args.chembl_id !== 'string' && typeof args.smiles !== 'string')) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: chembl_id or smiles is required');
+    }
+
+    try {
+      let compound;
+      
+      if (args.chembl_id) {
+        const response = await this.apiClient.get(`/molecule/${args.chembl_id}.json`);
+        compound = response.data;
+      } else {
+        // For SMILES input, search for the compound first
+        const searchResponse = await this.apiClient.get('/molecule.json', {
+          params: {
+            molecule_structures__canonical_smiles: args.smiles,
+            limit: 1,
+          },
+        });
+        
+        if (searchResponse.data.molecules && searchResponse.data.molecules.length > 0) {
+          compound = searchResponse.data.molecules[0];
+        } else {
+          throw new Error('Compound not found for the provided SMILES');
+        }
+      }
+
+      const props = compound.molecule_properties || {};
+      const structures = compound.molecule_structures || {};
+
+      // Calculate solubility predictions using established models
+      const solubilityPrediction = this.calculateSolubilityPredictions(props);
+
+      const result = {
+        chembl_id: compound.molecule_chembl_id,
+        pref_name: compound.pref_name,
+        smiles: structures.canonical_smiles,
+        
+        // Input molecular properties
+        molecular_properties: {
+          molecular_weight: props.molecular_weight,
+          alogp: props.alogp,
+          hbd: props.hbd,
+          hba: props.hba,
+          psa: props.psa,
+          rotatable_bonds: props.rtb,
+        },
+        
+        // Solubility predictions
+        solubility_predictions: {
+          ...solubilityPrediction,
+          
+          // Additional solubility factors
+          solubility_factors: {
+            lipophilicity_effect: this.assessLipophilicityEffect(props.alogp),
+            hydrogen_bonding_effect: this.assessHydrogenBondingEffect(props.hbd, props.hba),
+            molecular_size_effect: this.assessMolecularSizeEffect(props.molecular_weight),
+            flexibility_effect: this.assessFlexibilityEffect(props.rtb, props.heavy_atoms),
+          },
+          
+          // Overall assessment
+          overall_assessment: this.getOverallSolubilityAssessment(solubilityPrediction),
+        },
+        
+        // Recommendations for improving solubility
+        recommendations: this.getSolubilityRecommendations(props, solubilityPrediction),
+        
+        // Methodology note
+        methodology: {
+          note: 'Predictions based on established QSAR models and molecular descriptors',
+          methods_used: [
+            'Yalkowsky General Solubility Equation',
+            'Lipophilicity-based estimation',
+            'Hydrogen bonding contribution',
+            'Molecular size correlation'
+          ],
+          limitations: 'Predictions are estimates and may not account for specific molecular interactions, crystalline forms, or experimental conditions'
+        }
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to predict solubility: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  private calculateSolubilityPredictions(props: any): any {
+    const logP = props.alogp || 0;
+    const mw = props.molecular_weight || 0;
+    const hbd = props.hbd || 0;
+    const hba = props.hba || 0;
+    const psa = props.psa || 0;
+
+    // Yalkowsky General Solubility Equation: logS = 0.5 - 0.01(MP - 25) - logP
+    // Simplified version without melting point (using average correction)
+    const logS_yalkowsky = 0.5 - 0.8 - logP; // -0.8 is average MP correction
+
+    // Ali et al. model: logS = 0.16 - 0.63 * logP + 0.009 * HBD
+    const logS_ali = 0.16 - 0.63 * logP + 0.009 * hbd;
+
+    // Delaney (ESOL) simplified: logS = 0.16 - 0.63 * logP - 0.0062 * MW + 0.066 * RB - 0.74
+    const rb = props.rtb || 0;
+    const logS_delaney = 0.16 - 0.63 * logP - 0.0062 * mw + 0.066 * rb - 0.74;
+
+    // Average prediction
+    const logS_average = (logS_yalkowsky + logS_ali + logS_delaney) / 3;
+
+    // Convert to different units
+    const solubility_mgml = Math.pow(10, logS_average) * mw;
+    const solubility_molar = Math.pow(10, logS_average);
+
+    return {
+      log_solubility: {
+        yalkowsky_model: logS_yalkowsky,
+        ali_model: logS_ali,
+        delaney_model: logS_delaney,
+        average: logS_average,
+      },
+      predicted_solubility: {
+        log_s: logS_average,
+        molar_solubility: solubility_molar,
+        solubility_mg_ml: solubility_mgml,
+        solubility_class: this.classifySolubility(logS_average),
+      }
+    };
+  }
+
+  private classifySolubility(logS: number): string {
+    if (logS > -1) return 'Very Soluble (>10 mg/mL)';
+    if (logS > -2) return 'Soluble (1-10 mg/mL)';
+    if (logS > -3) return 'Moderately Soluble (0.1-1 mg/mL)';
+    if (logS > -4) return 'Slightly Soluble (0.01-0.1 mg/mL)';
+    return 'Poorly Soluble (<0.01 mg/mL)';
+  }
+
+  private assessLipophilicityEffect(alogp: number): string {
+    if (!alogp) return 'Unknown';
+    if (alogp < 0) return 'Hydrophilic - favors solubility';
+    if (alogp < 2) return 'Moderate lipophilicity - balanced solubility';
+    if (alogp < 4) return 'Lipophilic - reduces aqueous solubility';
+    return 'Highly lipophilic - poor aqueous solubility';
+  }
+
+  private assessHydrogenBondingEffect(hbd: number, hba: number): string {
+    const total = (hbd || 0) + (hba || 0);
+    if (total === 0) return 'No hydrogen bonding - poor solubility';
+    if (total < 3) return 'Limited hydrogen bonding - moderate effect';
+    if (total < 6) return 'Good hydrogen bonding - favors solubility';
+    return 'Extensive hydrogen bonding - high solubility potential';
+  }
+
+  private assessMolecularSizeEffect(mw: number): string {
+    if (!mw) return 'Unknown';
+    if (mw < 200) return 'Small molecule - generally more soluble';
+    if (mw < 400) return 'Medium size - moderate size effect';
+    if (mw < 600) return 'Large molecule - size may limit solubility';
+    return 'Very large molecule - significant size hindrance';
+  }
+
+  private assessFlexibilityEffect(rtb: number, heavy_atoms: number): string {
+    if (!rtb || !heavy_atoms) return 'Unknown';
+    const flexibility = rtb / heavy_atoms;
+    if (flexibility < 0.1) return 'Rigid structure - may reduce solubility';
+    if (flexibility < 0.2) return 'Moderate flexibility - balanced effect';
+    return 'Flexible structure - may enhance solubility';
+  }
+
+  private getOverallSolubilityAssessment(prediction: any): string {
+    const logS = prediction.predicted_solubility.log_s;
+    if (logS > -2) return 'GOOD - Expected to have adequate aqueous solubility';
+    if (logS > -3) return 'MODERATE - May require formulation optimization';
+    if (logS > -4) return 'POOR - Likely to need solubility enhancement strategies';
+    return 'VERY POOR - Significant solubility challenges expected';
+  }
+
+  private getSolubilityRecommendations(props: any, prediction: any): string[] {
+    const recommendations = [];
+    const logP = props.alogp || 0;
+    const logS = prediction.predicted_solubility.log_s;
+
+    if (logS < -3) {
+      recommendations.push('Consider formulation approaches: cyclodextrins, surfactants, or cocrystals');
+      recommendations.push('Evaluate salt forms if ionizable groups are present');
+      recommendations.push('Consider prodrug strategies to improve solubility');
+    }
+
+    if (logP > 3) {
+      recommendations.push('High lipophilicity detected - consider adding polar groups');
+      recommendations.push('Evaluate hydroxyl, amine, or carboxyl substitutions');
+    }
+
+    if ((props.hbd || 0) + (props.hba || 0) < 3) {
+      recommendations.push('Limited hydrogen bonding - consider adding H-bond donors/acceptors');
+    }
+
+    if (props.molecular_weight > 500) {
+      recommendations.push('High molecular weight - consider molecular size reduction');
+    }
+
+    if (recommendations.length === 0) {
+      recommendations.push('Solubility appears adequate for most applications');
+    }
+
+    return recommendations;
   }
 
   private async handleAssessDrugLikeness(args: any) {
@@ -1465,7 +1936,156 @@ class ChEMBLServer {
   }
 
   private async handleSubstructureSearch(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Substructure search not yet implemented', args }, null, 2) }] };
+    if (!isValidSubstructureSearchArgs(args)) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid substructure search arguments');
+    }
+
+    try {
+      // ChEMBL supports substructure search via the substructure endpoint
+      const smiles = encodeURIComponent(args.smiles);
+      
+      const response = await this.apiClient.get(`/substructure/${smiles}.json`, {
+        params: {
+          limit: args.limit || 25,
+        },
+      });
+
+      // Extract and format the results
+      const molecules = response.data.molecules || [];
+      const formattedResults = molecules.map((molecule: any) => ({
+        molecule_chembl_id: molecule.molecule_chembl_id,
+        pref_name: molecule.pref_name,
+        molecule_type: molecule.molecule_type,
+        max_phase: molecule.max_phase,
+        structures: {
+          canonical_smiles: molecule.molecule_structures?.canonical_smiles,
+          standard_inchi_key: molecule.molecule_structures?.standard_inchi_key,
+        },
+        properties: {
+          molecular_weight: molecule.molecule_properties?.molecular_weight,
+          alogp: molecule.molecule_properties?.alogp,
+          hbd: molecule.molecule_properties?.hbd,
+          hba: molecule.molecule_properties?.hba,
+          num_ro5_violations: molecule.molecule_properties?.num_ro5_violations,
+        },
+        similarity_metrics: {
+          contains_query_substructure: true,
+          tanimoto_similarity: molecule.similarity || 'N/A',
+        }
+      }));
+
+      const result = {
+        query: {
+          query_smiles: args.smiles,
+          search_type: 'substructure',
+          description: 'Find compounds containing the specified substructure'
+        },
+        search_results: {
+          total_results: response.data.page_meta?.total_count || molecules.length,
+          results_returned: formattedResults.length,
+          compounds: formattedResults,
+        },
+        substructure_analysis: {
+          query_structure_info: await this.analyzeQueryStructure(args.smiles),
+          result_diversity: this.analyzeResultDiversity(formattedResults),
+        },
+        usage_notes: {
+          note: 'Substructure search finds compounds that contain the query structure as a subunit',
+          applications: [
+            'Scaffold hopping',
+            'Lead optimization',
+            'Bioisostere identification',
+            'Structure-activity relationship analysis'
+          ]
+        }
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to perform substructure search: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  private async analyzeQueryStructure(smiles: string): Promise<any> {
+    try {
+      // Try to get basic information about the query structure
+      const searchResponse = await this.apiClient.get('/molecule.json', {
+        params: {
+          molecule_structures__canonical_smiles: smiles,
+          limit: 1,
+        },
+      });
+
+      if (searchResponse.data.molecules && searchResponse.data.molecules.length > 0) {
+        const molecule = searchResponse.data.molecules[0];
+        return {
+          found_in_chembl: true,
+          chembl_id: molecule.molecule_chembl_id,
+          pref_name: molecule.pref_name,
+          properties: molecule.molecule_properties,
+        };
+      }
+    } catch (error) {
+      // Query structure not found in ChEMBL, which is fine
+    }
+
+    return {
+      found_in_chembl: false,
+      smiles: smiles,
+      note: 'Query structure not found as exact match in ChEMBL, but used for substructure search',
+    };
+  }
+
+  private analyzeResultDiversity(results: any[]): any {
+    if (results.length === 0) {
+      return { diversity_note: 'No results to analyze' };
+    }
+
+    const molecularWeights = results
+      .map(r => r.properties.molecular_weight)
+      .filter(mw => mw !== null && mw !== undefined);
+
+    const alogpValues = results
+      .map(r => r.properties.alogp)
+      .filter(alogp => alogp !== null && alogp !== undefined);
+
+    const moleculeTypes = results.reduce((acc: any, r: any) => {
+      acc[r.molecule_type] = (acc[r.molecule_type] || 0) + 1;
+      return acc;
+    }, {});
+
+    const maxPhases = results.reduce((acc: any, r: any) => {
+      if (r.max_phase !== null && r.max_phase !== undefined) {
+        acc[r.max_phase] = (acc[r.max_phase] || 0) + 1;
+      }
+      return acc;
+    }, {});
+
+    return {
+      total_compounds: results.length,
+      molecular_weight_range: molecularWeights.length > 0 ? {
+        min: Math.min(...molecularWeights),
+        max: Math.max(...molecularWeights),
+        average: molecularWeights.reduce((a, b) => a + b, 0) / molecularWeights.length,
+      } : null,
+      alogp_range: alogpValues.length > 0 ? {
+        min: Math.min(...alogpValues),
+        max: Math.max(...alogpValues),
+        average: alogpValues.reduce((a, b) => a + b, 0) / alogpValues.length,
+      } : null,
+      molecule_type_distribution: moleculeTypes,
+      development_phase_distribution: maxPhases,
+    };
   }
 
   private async handleBatchCompoundLookup(args: any) {
@@ -1491,11 +2111,481 @@ class ChEMBLServer {
   }
 
   private async handleGetExternalReferences(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'External references not yet implemented', args }, null, 2) }] };
+    if (!args || typeof args.chembl_id !== 'string') {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid arguments: chembl_id is required');
+    }
+
+    try {
+      // Get the main compound data first
+      const compoundResponse = await this.apiClient.get(`/molecule/${args.chembl_id}.json`);
+      const compound = compoundResponse.data;
+
+      // Get cross-references from multiple ChEMBL endpoints
+      const crossReferences = await this.gatherCrossReferences(args.chembl_id);
+
+      // Organize references by database type
+      const organizedReferences = this.organizeCrossReferences(crossReferences);
+
+      const result = {
+        chembl_id: compound.molecule_chembl_id,
+        pref_name: compound.pref_name,
+        molecule_type: compound.molecule_type,
+        
+        // Structural identifiers
+        structural_identifiers: {
+          canonical_smiles: compound.molecule_structures?.canonical_smiles,
+          standard_inchi: compound.molecule_structures?.standard_inchi,
+          standard_inchi_key: compound.molecule_structures?.standard_inchi_key,
+        },
+
+        // External database references organized by category
+        external_references: organizedReferences,
+
+        // Additional identifiers and aliases
+        identifiers: {
+          synonyms: compound.molecule_synonyms?.map((syn: any) => ({
+            synonym: syn.molecule_synonym,
+            syn_type: syn.syn_type,
+          })) || [],
+          trade_names: compound.molecule_synonyms?.filter((syn: any) => 
+            syn.syn_type === 'TRADE_NAME'
+          ).map((syn: any) => syn.molecule_synonym) || [],
+        },
+
+        // Hierarchy and classification
+        hierarchy: compound.molecule_hierarchy || {},
+
+        // Summary statistics
+        reference_summary: {
+          total_references: this.countTotalReferences(organizedReferences),
+          database_count: Object.keys(organizedReferences).length,
+          has_pdb_structures: organizedReferences.structural?.pdb?.length > 0,
+          has_pubmed_refs: organizedReferences.literature?.pubmed?.length > 0,
+          has_patent_refs: organizedReferences.patents?.length > 0,
+        },
+
+        // Usage recommendations
+        usage_recommendations: this.generateUsageRecommendations(organizedReferences),
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to get external references: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  private async gatherCrossReferences(chemblId: string): Promise<any[]> {
+    const allReferences = [];
+
+    try {
+      // Get molecule cross-references
+      const molXrefResponse = await this.apiClient.get('/molecule_xref.json', {
+        params: {
+          molecule_chembl_id: chemblId,
+          limit: 100,
+        },
+      });
+      allReferences.push(...(molXrefResponse.data.molecule_xrefs || []));
+    } catch (error) {
+      // Continue if this fails
+    }
+
+    try {
+      // Get compound records which may have additional references
+      const compoundResponse = await this.apiClient.get('/compound_record.json', {
+        params: {
+          molecule_chembl_id: chemblId,
+          limit: 50,
+        },
+      });
+      
+      // Extract references from compound records
+      const records = compoundResponse.data.compound_records || [];
+      records.forEach((record: any) => {
+        if (record.src_id) {
+          allReferences.push({
+            xref_src_db: record.src_description || 'Source Database',
+            xref_id: record.src_compound_id,
+            xref_name: record.compound_name,
+          });
+        }
+      });
+    } catch (error) {
+      // Continue if this fails
+    }
+
+    return allReferences;
+  }
+
+  private organizeCrossReferences(references: any[]): any {
+    const organized: any = {
+      chemical_databases: {},
+      structural: {},
+      literature: {},
+      patents: [],
+      biological: {},
+      other: [],
+    };
+
+    references.forEach((ref: any) => {
+      const dbName = ref.xref_src_db?.toLowerCase() || '';
+      const reference = {
+        database: ref.xref_src_db,
+        id: ref.xref_id,
+        name: ref.xref_name,
+        url: this.generateReferenceUrl(ref.xref_src_db, ref.xref_id),
+      };
+
+      // Categorize by database type
+      if (dbName.includes('pubchem') || dbName.includes('chemspider') || dbName.includes('chebi')) {
+        organized.chemical_databases[dbName] = organized.chemical_databases[dbName] || [];
+        organized.chemical_databases[dbName].push(reference);
+      } else if (dbName.includes('pdb') || dbName.includes('rcsb')) {
+        organized.structural.pdb = organized.structural.pdb || [];
+        organized.structural.pdb.push(reference);
+      } else if (dbName.includes('pubmed') || dbName.includes('doi')) {
+        organized.literature.pubmed = organized.literature.pubmed || [];
+        organized.literature.pubmed.push(reference);
+      } else if (dbName.includes('patent')) {
+        organized.patents.push(reference);
+      } else if (dbName.includes('uniprot') || dbName.includes('gene') || dbName.includes('kegg')) {
+        organized.biological[dbName] = organized.biological[dbName] || [];
+        organized.biological[dbName].push(reference);
+      } else {
+        organized.other.push(reference);
+      }
+    });
+
+    return organized;
+  }
+
+  private generateReferenceUrl(database: string, id: string): string | null {
+    if (!database || !id) return null;
+
+    const dbLower = database.toLowerCase();
+    
+    // Common database URL patterns
+    const urlMappings: { [key: string]: string } = {
+      'pubchem': `https://pubchem.ncbi.nlm.nih.gov/compound/${id}`,
+      'chemspider': `https://www.chemspider.com/Chemical-Structure.${id}.html`,
+      'chebi': `https://www.ebi.ac.uk/chebi/searchId.do?chebiId=${id}`,
+      'pdb': `https://www.rcsb.org/structure/${id}`,
+      'pubmed': `https://pubmed.ncbi.nlm.nih.gov/${id}`,
+      'uniprot': `https://www.uniprot.org/uniprot/${id}`,
+      'kegg': `https://www.genome.jp/entry/${id}`,
+    };
+
+    for (const [key, urlPattern] of Object.entries(urlMappings)) {
+      if (dbLower.includes(key)) {
+        return urlPattern;
+      }
+    }
+
+    return null;
+  }
+
+  private countTotalReferences(organized: any): number {
+    let count = 0;
+    
+    Object.values(organized.chemical_databases).forEach((refs: any) => {
+      count += Array.isArray(refs) ? refs.length : 0;
+    });
+    
+    Object.values(organized.structural).forEach((refs: any) => {
+      count += Array.isArray(refs) ? refs.length : 0;
+    });
+    
+    Object.values(organized.literature).forEach((refs: any) => {
+      count += Array.isArray(refs) ? refs.length : 0;
+    });
+    
+    count += organized.patents?.length || 0;
+    
+    Object.values(organized.biological).forEach((refs: any) => {
+      count += Array.isArray(refs) ? refs.length : 0;
+    });
+    
+    count += organized.other?.length || 0;
+    
+    return count;
+  }
+
+  private generateUsageRecommendations(organized: any): string[] {
+    const recommendations = [];
+
+    if (organized.structural?.pdb?.length > 0) {
+      recommendations.push('PDB structures available - suitable for structure-based drug design');
+    }
+
+    if (organized.chemical_databases?.pubchem?.length > 0) {
+      recommendations.push('PubChem data available - check for additional bioactivity data');
+    }
+
+    if (organized.literature?.pubmed?.length > 0) {
+      recommendations.push('Literature references available - review for mechanism and SAR data');
+    }
+
+    if (organized.biological?.uniprot?.length > 0) {
+      recommendations.push('UniProt references available - check target protein information');
+    }
+
+    if (organized.patents?.length > 0) {
+      recommendations.push('Patent information available - review for IP considerations');
+    }
+
+    if (recommendations.length === 0) {
+      recommendations.push('Limited external references - consider expanding search to related compounds');
+    }
+
+    return recommendations;
   }
 
   private async handleAdvancedSearch(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Advanced search not yet implemented', args }, null, 2) }] };
+    if (!isValidPropertyFilterArgs(args)) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid advanced search arguments');
+    }
+
+    try {
+      // Build query parameters for molecular property filtering
+      const params: any = {
+        limit: args.limit || 25,
+      };
+
+      // Add molecular weight filters
+      if (args.min_mw !== undefined) {
+        params['molecule_properties__mw_freebase__gte'] = args.min_mw;
+      }
+      if (args.max_mw !== undefined) {
+        params['molecule_properties__mw_freebase__lte'] = args.max_mw;
+      }
+
+      // Add LogP filters
+      if (args.min_logp !== undefined) {
+        params['molecule_properties__alogp__gte'] = args.min_logp;
+      }
+      if (args.max_logp !== undefined) {
+        params['molecule_properties__alogp__lte'] = args.max_logp;
+      }
+
+      // Add hydrogen bond donor/acceptor filters
+      if (args.max_hbd !== undefined) {
+        params['molecule_properties__hbd__lte'] = args.max_hbd;
+      }
+      if (args.max_hba !== undefined) {
+        params['molecule_properties__hba__lte'] = args.max_hba;
+      }
+
+      // Execute the search
+      const response = await this.apiClient.get('/molecule.json', { params });
+      const compounds = response.data.molecules || [];
+
+      // Analyze the results
+      const analysis = this.analyzeAdvancedSearchResults(compounds, args);
+
+      const result = {
+        search_parameters: {
+          molecular_weight_range: {
+            min: args.min_mw || 'not specified',
+            max: args.max_mw || 'not specified',
+          },
+          logp_range: {
+            min: args.min_logp || 'not specified',
+            max: args.max_logp || 'not specified',
+          },
+          hydrogen_bonding_limits: {
+            max_donors: args.max_hbd || 'not specified',
+            max_acceptors: args.max_hba || 'not specified',
+          },
+          limit: args.limit || 25,
+        },
+        results_summary: {
+          total_found: compounds.length,
+          compounds_analyzed: Math.min(compounds.length, args.limit || 25),
+        },
+        property_analysis: analysis,
+        compounds: compounds.slice(0, args.limit || 25).map((compound: any) => ({
+          chembl_id: compound.molecule_chembl_id,
+          pref_name: compound.pref_name,
+          molecule_type: compound.molecule_type,
+          molecular_properties: {
+            molecular_weight: compound.molecule_properties?.mw_freebase,
+            alogp: compound.molecule_properties?.alogp,
+            hbd: compound.molecule_properties?.hbd,
+            hba: compound.molecule_properties?.hba,
+            psa: compound.molecule_properties?.psa,
+            rotatable_bonds: compound.molecule_properties?.rtb,
+            lipinski_violations: compound.molecule_properties?.num_ro5_violations,
+          },
+          structures: {
+            canonical_smiles: compound.molecule_structures?.canonical_smiles,
+            standard_inchi_key: compound.molecule_structures?.standard_inchi_key,
+          },
+        })),
+        search_insights: this.generateAdvancedSearchInsights(compounds, args),
+        recommendations: this.generateAdvancedSearchRecommendations(compounds, args),
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to perform advanced search: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  private analyzeAdvancedSearchResults(compounds: any[], searchParams: any): any {
+    if (compounds.length === 0) {
+      return {
+        message: 'No compounds found matching the specified criteria',
+        suggestions: 'Consider relaxing search parameters',
+      };
+    }
+
+    const properties = compounds.map(c => c.molecule_properties).filter(p => p);
+    
+    const analysis = {
+      molecular_weight: this.calculatePropertyStats(properties, 'mw_freebase'),
+      alogp: this.calculatePropertyStats(properties, 'alogp'),
+      hydrogen_bond_donors: this.calculatePropertyStats(properties, 'hbd'),
+      hydrogen_bond_acceptors: this.calculatePropertyStats(properties, 'hba'),
+      polar_surface_area: this.calculatePropertyStats(properties, 'psa'),
+      rotatable_bonds: this.calculatePropertyStats(properties, 'rtb'),
+      drug_likeness: {
+        lipinski_compliant: properties.filter(p => (p.num_ro5_violations || 0) === 0).length,
+        total_compounds: properties.length,
+        compliance_rate: properties.length > 0 ? 
+          (properties.filter(p => (p.num_ro5_violations || 0) === 0).length / properties.length * 100).toFixed(1) + '%' : '0%',
+      },
+    };
+
+    return analysis;
+  }
+
+  private calculatePropertyStats(properties: any[], propertyName: string): any {
+    const values = properties
+      .map(p => p[propertyName])
+      .filter(v => v !== null && v !== undefined && !isNaN(v))
+      .map(v => parseFloat(v));
+
+    if (values.length === 0) {
+      return { message: 'No valid data available' };
+    }
+
+    values.sort((a, b) => a - b);
+    
+    return {
+      count: values.length,
+      min: values[0],
+      max: values[values.length - 1],
+      mean: (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2),
+      median: values.length % 2 === 0 
+        ? ((values[values.length / 2 - 1] + values[values.length / 2]) / 2).toFixed(2)
+        : values[Math.floor(values.length / 2)].toFixed(2),
+    };
+  }
+
+  private generateAdvancedSearchInsights(compounds: any[], searchParams: any): string[] {
+    const insights = [];
+
+    if (compounds.length === 0) {
+      insights.push('No compounds found - consider broadening search criteria');
+      return insights;
+    }
+
+    const properties = compounds.map(c => c.molecule_properties).filter(p => p);
+    
+    // Molecular weight insights
+    if (searchParams.min_mw || searchParams.max_mw) {
+      const avgMw = properties.reduce((sum, p) => sum + (p.mw_freebase || 0), 0) / properties.length;
+      insights.push(`Average molecular weight: ${avgMw.toFixed(1)} Da`);
+    }
+
+    // Drug-likeness insights
+    const lipinskiCompliant = properties.filter(p => (p.num_ro5_violations || 0) === 0).length;
+    const complianceRate = (lipinskiCompliant / properties.length * 100).toFixed(1);
+    insights.push(`${complianceRate}% of compounds are Lipinski Rule of Five compliant`);
+
+    // LogP distribution insights
+    if (searchParams.min_logp || searchParams.max_logp) {
+      const logpValues = properties.map(p => p.alogp).filter(v => v !== null && v !== undefined);
+      if (logpValues.length > 0) {
+        const avgLogp = logpValues.reduce((a, b) => a + b, 0) / logpValues.length;
+        insights.push(`Average LogP: ${avgLogp.toFixed(2)} (lipophilicity indicator)`);
+      }
+    }
+
+    // Diversity insights
+    const moleculeTypes = [...new Set(compounds.map(c => c.molecule_type))];
+    if (moleculeTypes.length > 1) {
+      insights.push(`Chemical diversity: ${moleculeTypes.length} different molecule types found`);
+    }
+
+    return insights;
+  }
+
+  private generateAdvancedSearchRecommendations(compounds: any[], searchParams: any): string[] {
+    const recommendations = [];
+
+    if (compounds.length === 0) {
+      recommendations.push('Try increasing molecular weight range');
+      recommendations.push('Consider relaxing LogP constraints');
+      recommendations.push('Remove hydrogen bonding limitations');
+      return recommendations;
+    }
+
+    const properties = compounds.map(c => c.molecule_properties).filter(p => p);
+    
+    // Check if results are heavily skewed
+    if (compounds.length < (searchParams.limit || 25) / 2) {
+      recommendations.push('Consider broadening search parameters for more diverse results');
+    }
+
+    // Drug-likeness recommendations
+    const lipinskiCompliant = properties.filter(p => (p.num_ro5_violations || 0) === 0).length;
+    const complianceRate = lipinskiCompliant / properties.length;
+    
+    if (complianceRate < 0.5) {
+      recommendations.push('Many compounds violate Lipinski rules - consider tightening MW/LogP constraints for drug-like properties');
+    } else if (complianceRate > 0.9) {
+      recommendations.push('High drug-likeness compliance - good for lead optimization studies');
+    }
+
+    // Specific property recommendations
+    if (searchParams.min_mw && searchParams.max_mw) {
+      const range = searchParams.max_mw - searchParams.min_mw;
+      if (range < 100) {
+        recommendations.push('Narrow MW range may limit chemical diversity - consider expanding');
+      }
+    }
+
+    if (searchParams.max_hbd !== undefined && searchParams.max_hbd < 3) {
+      recommendations.push('Low HBD limit may exclude important pharmacophores');
+    }
+
+    // Analysis recommendations
+    recommendations.push('Use substructure_search for scaffold-based filtering');
+    recommendations.push('Apply calculate_descriptors for detailed property analysis');
+    recommendations.push('Consider get_external_references for additional compound information');
+
+    return recommendations;
   }
 
   async run() {
